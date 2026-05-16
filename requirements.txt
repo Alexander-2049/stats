@@ -1,0 +1,6 @@
+geopandas
+gerrychain
+matplotlib
+networkx
+numpy
+tqdm

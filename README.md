@@ -201,3 +201,20 @@
 
 - явную топологическую проверку на внутренние отверстия;
 - пост-обработку, которая устраняет такие отверстия без нарушения ограничений по населению и связности.
+
+## Карты и визуализации
+
+Отдельные страницы с визуализациями и пояснениями:
+
+- [Общая карта округов](./osm_connectedness/docs/buurten_districted_map.md)
+- [Карта населения округов](./osm_connectedness/docs/district_population_map.md)
+- [Карта отклонения населения от цели](./osm_connectedness/docs/district_population_deviation_map.md)
+- [Карта connectedness score](./osm_connectedness/docs/district_connectedness_map.md)
+- [Карта внутренних дыр](./osm_connectedness/docs/district_holes_map.md)
+- [Карта числа геометрических компонент](./osm_connectedness/docs/district_components_map.md)
+- [Карта с подписями district_id](./osm_connectedness/docs/district_id_labeled_map.md)
+
+Структура файлов:
+
+- изображения лежат в `osm_connectedness/assets/`
+- Markdown-описания лежат в `osm_connectedness/docs/`

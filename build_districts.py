@@ -22,13 +22,23 @@ import heapq
 import math
 import pickle
 import random
+import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import geopandas as gpd
 import networkx as nx
 import numpy as np
+from gerrychain import Graph as GerryGraph
+from gerrychain.tree import bipartition_tree, recursive_tree_part
 from tqdm import tqdm
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -654,6 +664,299 @@ def export_result(
     print("  Done.")
 
 
+def pop_bounds_gap(p: int) -> int:
+    if p < POP_MIN:
+        return POP_MIN - p
+    if p > POP_MAX:
+        return p - POP_MAX
+    return 0
+
+
+def district_populations(district: np.ndarray, pop: np.ndarray) -> np.ndarray:
+    d_pop = np.zeros(N_DISTRICTS, dtype=np.int64)
+    for node, d in enumerate(district):
+        d_pop[int(d)] += pop[node]
+    return d_pop
+
+
+def count_valid_districts_from_assignment(district: np.ndarray, pop: np.ndarray) -> int:
+    d_pop = district_populations(district, pop)
+    return int(np.sum((d_pop >= POP_MIN) & (d_pop <= POP_MAX)))
+
+
+def region_grow(G: nx.Graph, seeds: list[int], pop: np.ndarray) -> np.ndarray:
+    """
+    Population-first seeded region growing.
+
+    At each step we expand the currently lightest district by assigning its
+    strongest frontier node. This preserves contiguity while producing a much
+    better population-balanced starting partition.
+    """
+    n = G.number_of_nodes()
+    district = np.full(n, -1, dtype=np.int32)
+    d_pop = np.zeros(N_DISTRICTS, dtype=np.int64)
+
+    for d, seed in enumerate(seeds):
+        district[seed] = d
+        d_pop[d] = pop[seed]
+
+    frontiers: list[dict[int, float]] = [dict() for _ in range(N_DISTRICTS)]
+    for d, seed in enumerate(seeds):
+        for nb in G.neighbors(seed):
+            if district[nb] == -1:
+                node = int(nb)
+                weight = float(G[seed][nb]["weight"])
+                frontiers[d][node] = max(frontiers[d].get(node, 0.0), weight)
+
+    remaining = n - N_DISTRICTS
+    with tqdm(total=remaining, desc="  Growing regions", unit="buurt") as pbar:
+        while remaining > 0:
+            active = [d for d in range(N_DISTRICTS) if frontiers[d]]
+            if not active:
+                break
+
+            d = min(
+                active,
+                key=lambda idx: (
+                    max(0, int(d_pop[idx]) - POP_MAX),
+                    int(d_pop[idx]),
+                ),
+            )
+
+            stale_nodes = [node for node in frontiers[d] if district[node] != -1]
+            for node in stale_nodes:
+                del frontiers[d][node]
+            if not frontiers[d]:
+                continue
+
+            node, _ = max(
+                frontiers[d].items(),
+                key=lambda item: (item[1], -int(pop[item[0]]), -item[0]),
+            )
+            del frontiers[d][node]
+            if district[node] != -1:
+                continue
+
+            district[node] = d
+            d_pop[d] += pop[node]
+            remaining -= 1
+            pbar.update(1)
+
+            for nb in G.neighbors(node):
+                if district[nb] == -1:
+                    nb_i = int(nb)
+                    weight = float(G[node][nb]["weight"])
+                    frontiers[d][nb_i] = max(frontiers[d].get(nb_i, 0.0), weight)
+
+    if np.any(district == -1):
+        raise RuntimeError("Region growing left unassigned nodes.")
+
+    return district
+
+
+def rebalance_districts(
+    G: nx.Graph,
+    district: np.ndarray,
+    pop: np.ndarray,
+    max_passes: int = 250,
+) -> np.ndarray:
+    """
+    Greedy population repair.
+
+    Repeatedly applies boundary transfers that improve local validity first,
+    then reduce out-of-bounds population gap, then reduce quadratic penalty.
+    """
+    d_pop = district_populations(district, pop)
+    d_nodes = build_district_node_sets(district)
+
+    for pass_num in range(max_passes):
+        moved = 0
+        boundary = sorted(
+            build_boundary_set(G, district),
+            key=lambda u: (
+                pop_bounds_gap(int(d_pop[int(district[u])])),
+                int(d_pop[int(district[u])]),
+            ),
+            reverse=True,
+        )
+
+        for u in boundary:
+            src_d = int(district[u])
+            src_pop = int(d_pop[src_d])
+
+            if len(d_nodes[src_d]) <= 1:
+                continue
+            if not is_removal_safe(G, d_nodes[src_d], u):
+                continue
+
+            best_tgt: int | None = None
+            best_score: tuple[int, int, float, float] | None = None
+            u_pop = int(pop[u])
+
+            for v in G.neighbors(u):
+                tgt_d = int(district[v])
+                if tgt_d == src_d:
+                    continue
+
+                tgt_pop = int(d_pop[tgt_d])
+                new_src = src_pop - u_pop
+                new_tgt = tgt_pop + u_pop
+
+                old_valid_local = int(POP_MIN <= src_pop <= POP_MAX) + int(POP_MIN <= tgt_pop <= POP_MAX)
+                new_valid_local = int(POP_MIN <= new_src <= POP_MAX) + int(POP_MIN <= new_tgt <= POP_MAX)
+                valid_gain = new_valid_local - old_valid_local
+
+                gap_old = pop_bounds_gap(src_pop) + pop_bounds_gap(tgt_pop)
+                gap_new = pop_bounds_gap(new_src) + pop_bounds_gap(new_tgt)
+                gap_gain = gap_old - gap_new
+
+                pen_old = calc_penalty(src_pop) + calc_penalty(tgt_pop)
+                pen_new = calc_penalty(new_src) + calc_penalty(new_tgt)
+                pen_gain = pen_old - pen_new
+                conn_gain = score_delta(G, district, u, tgt_d)
+
+                if valid_gain < 0:
+                    continue
+                if valid_gain == 0 and gap_gain < 0:
+                    continue
+                if valid_gain == 0 and gap_gain == 0 and pen_gain <= 0:
+                    continue
+
+                score = (valid_gain, gap_gain, pen_gain, conn_gain)
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_tgt = tgt_d
+
+            if best_tgt is None:
+                continue
+
+            d_nodes[src_d].discard(u)
+            d_nodes[best_tgt].add(u)
+            d_pop[src_d] -= pop[u]
+            d_pop[best_tgt] += pop[u]
+            district[u] = best_tgt
+            moved += 1
+
+        valid_count = int(np.sum((d_pop >= POP_MIN) & (d_pop <= POP_MAX)))
+        print(
+            f"  Rebalance pass {pass_num + 1:>3}: "
+            f"moved {moved:>5} nodes | "
+            f"valid={valid_count:>3}/{N_DISTRICTS} | "
+            f"std={d_pop.std():>8,.0f}"
+        )
+        if valid_count == N_DISTRICTS:
+            print("  Rebalance reached full population validity.")
+            break
+        if moved == 0:
+            break
+
+    return district
+
+
+def refine_connectedness(
+    G: nx.Graph,
+    district: np.ndarray,
+    pop: np.ndarray,
+    max_passes: int = 25,
+) -> np.ndarray:
+    """
+    Improves connectedness without leaving the valid population window.
+    """
+    d_pop = district_populations(district, pop)
+    d_nodes = build_district_node_sets(district)
+
+    for pass_num in range(max_passes):
+        moved = 0
+        gain_sum = 0.0
+
+        for u in list(build_boundary_set(G, district)):
+            src_d = int(district[u])
+            if len(d_nodes[src_d]) <= 1 or not is_removal_safe(G, d_nodes[src_d], u):
+                continue
+
+            best_tgt: int | None = None
+            best_gain = 0.0
+            u_pop = int(pop[u])
+
+            for v in G.neighbors(u):
+                tgt_d = int(district[v])
+                if tgt_d == src_d:
+                    continue
+
+                new_src = int(d_pop[src_d] - u_pop)
+                new_tgt = int(d_pop[tgt_d] + u_pop)
+                if not (POP_MIN <= new_src <= POP_MAX and POP_MIN <= new_tgt <= POP_MAX):
+                    continue
+
+                conn_gain = score_delta(G, district, u, tgt_d)
+                if conn_gain > best_gain:
+                    best_gain = conn_gain
+                    best_tgt = tgt_d
+
+            if best_tgt is None:
+                continue
+
+            d_nodes[src_d].discard(u)
+            d_nodes[best_tgt].add(u)
+            d_pop[src_d] -= pop[u]
+            d_pop[best_tgt] += pop[u]
+            district[u] = best_tgt
+            moved += 1
+            gain_sum += best_gain
+
+        print(
+            f"  Refinement pass {pass_num + 1:>3}: moved {moved:>5} nodes | "
+            f"connectedness +{gain_sum:>8,.1f}"
+        )
+        if moved == 0:
+            break
+
+    return district
+
+
+def tree_partition_districts(G: nx.Graph, pop: np.ndarray) -> np.ndarray:
+    """
+    Builds a fully connected, population-balanced districting using
+    GerryChain's recursive tree partitioner.
+    """
+    tree_graph = G.copy()
+    for node in tree_graph.nodes:
+        tree_graph.nodes[node]["population"] = int(pop[node])
+
+    tree_method = partial(bipartition_tree, max_attempts=50_000)
+    last_error: Exception | None = None
+    assignment = None
+
+    for attempt in range(1, 6):
+        try:
+            assignment = recursive_tree_part(
+                GerryGraph.from_networkx(tree_graph),
+                list(range(N_DISTRICTS)),
+                TARGET_POP,
+                "population",
+                POP_SLACK,
+                node_repeats=10,
+                method=tree_method,
+            )
+            print(f"  Tree partition succeeded on attempt {attempt}.")
+            break
+        except RuntimeError as exc:
+            last_error = exc
+            print(f"  Tree partition attempt {attempt} failed; retrying.")
+
+    if assignment is None:
+        raise RuntimeError("Tree partition could not find a valid plan.") from last_error
+
+    district = np.full(G.number_of_nodes(), -1, dtype=np.int32)
+    for node, part in assignment.items():
+        district[int(node)] = int(part)
+
+    if np.any(district == -1):
+        raise RuntimeError("Tree partition left unassigned nodes.")
+
+    return district
+
+
 # ──────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────
@@ -717,6 +1020,12 @@ def main() -> None:
         print("=" * 64)
         district = rebalance_districts(G, district, pop)
         validate(G, district, pop, "after rebalance")
+        if count_valid_districts_from_assignment(district, pop) != N_DISTRICTS:
+            print("\n" + "=" * 64)
+            print("Phase 1d - Recursive tree partition fallback")
+            print("=" * 64)
+            district = tree_partition_districts(G, pop)
+            validate(G, district, pop, "after tree partition")
 
     # ── Phase 2 ───────────────────────────────────────────────────
     print("\n" + "=" * 64)
@@ -726,15 +1035,31 @@ def main() -> None:
     print(f"  Targeted move fraction : {TARGETED_FRACTION:.0%}")
     print("=" * 64)
 
-    district = simulated_annealing(
-        G, district, pop,
-        n_iter   = SA_ITERATIONS,
-        T_start  = T_START,
-        T_end    = T_END,
-        rng      = rng,
-        start_it = start_iteration,
-    )
-    validate(G, district, pop, "after annealing")
+    valid_after_rebalance = count_valid_districts_from_assignment(district, pop)
+    if valid_after_rebalance == N_DISTRICTS:
+        print("\n" + "=" * 64)
+        print("Phase 2 â€” Connectedness refinement within valid bounds")
+        print("=" * 64)
+        district = refine_connectedness(G, district, pop)
+        validate(G, district, pop, "after refinement")
+    else:
+        before_sa = district.copy()
+        district_sa = simulated_annealing(
+            G, district, pop,
+            n_iter   = SA_ITERATIONS,
+            T_start  = T_START,
+            T_end    = T_END,
+            rng      = rng,
+            start_it = start_iteration,
+        )
+        after_sa_valid = count_valid_districts_from_assignment(district_sa, pop)
+        if after_sa_valid >= valid_after_rebalance:
+            district = district_sa
+            print(f"  Keeping annealed state ({after_sa_valid}/{N_DISTRICTS} valid districts).")
+        else:
+            district = before_sa
+            print(f"  Annealing regressed validity ({after_sa_valid}/{N_DISTRICTS}); keeping pre-SA state.")
+        validate(G, district, pop, "after annealing")
 
     # ── Phase 3 ───────────────────────────────────────────────────
     print("\n" + "=" * 64)
